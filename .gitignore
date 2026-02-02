@@ -37,3 +37,10 @@ venv/
 *.avi
 *.mkv
 *.webm
+# videos
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.mkv
+*.webm
