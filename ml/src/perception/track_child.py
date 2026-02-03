@@ -204,6 +204,69 @@ def bbox_from_pose_landmarks(
     return np.array([x0, y0, x1, y1], dtype=np.float32), confidence
 
 
+def hand_centroid(hand_lms: Any) -> Optional[Tuple[float, float]]:
+    """
+    Compute centroid of hand landmarks.
+    Returns (cx, cy) in normalized coordinates, or None if insufficient landmarks.
+    """
+    if hand_lms is None:
+        return None
+
+    xs, ys = [], []
+    for lm in hand_lms:
+        xs.append(float(lm.x))
+        ys.append(float(lm.y))
+
+    if len(xs) < 5:
+        return None
+
+    return (float(np.mean(xs)), float(np.mean(ys)))
+
+
+def point_in_bbox(pt: Tuple[float, float], bbox: np.ndarray) -> bool:
+    """
+    Check if point (x, y) is inside bbox [x0, y0, x1, y1, ...].
+    """
+    if bbox is None or not np.isfinite(bbox[0]):
+        return False
+    x, y = pt
+    return bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
+
+
+def bbox_iou(bbox1: Optional[np.ndarray], bbox2: Optional[np.ndarray]) -> float:
+    """
+    Compute IoU between two bboxes [x0, y0, x1, y1, ...].
+    Returns 0.0 if either is None or invalid.
+    """
+    if bbox1 is None or bbox2 is None:
+        return 0.0
+    if not np.isfinite(bbox1[0]) or not np.isfinite(bbox2[0]):
+        return 0.0
+
+    x0_1, y0_1, x1_1, y1_1 = bbox1[:4]
+    x0_2, y0_2, x1_2, y1_2 = bbox2[:4]
+
+    # Intersection
+    xi0 = max(x0_1, x0_2)
+    yi0 = max(y0_1, y0_2)
+    xi1 = min(x1_1, x1_2)
+    yi1 = min(y1_1, y1_2)
+
+    inter_w = max(0.0, xi1 - xi0)
+    inter_h = max(0.0, yi1 - yi0)
+    inter_area = inter_w * inter_h
+
+    # Union
+    area1 = (x1_1 - x0_1) * (y1_1 - y0_1)
+    area2 = (x1_2 - x0_2) * (y1_2 - y0_2)
+    union_area = area1 + area2 - inter_area
+
+    if union_area < 1e-8:
+        return 0.0
+
+    return float(inter_area / union_area)
+
+
 def classify_pose_as_child_or_adult(lms: Any, min_vis: float = 0.30) -> Optional[str]:
     """
     Classify a detected pose as 'child' or 'adult' based on position.
@@ -240,9 +303,17 @@ def classify_pose_as_child_or_adult(lms: Any, min_vis: float = 0.30) -> Optional
 
 def choose_child_and_parent_poses(
     poses: List[List[Any]],
+    prev_child_bbox: Optional[np.ndarray] = None,
+    iou_weight: float = 0.6,
 ) -> Tuple[Optional[List[Any]], Optional[List[Any]]]:
     """
     From multiple detected poses, identify child and parent poses.
+    Uses temporal continuity (IoU with previous child bbox) for robust tracking.
+
+    Args:
+        poses: list of pose landmark lists
+        prev_child_bbox: previous frame's child bbox for temporal continuity
+        iou_weight: weight for IoU score vs position score (0-1)
 
     Returns: (child_pose_landmarks, parent_pose_landmarks)
     """
@@ -257,32 +328,57 @@ def choose_child_and_parent_poses(
             return poses[0], None
         return poses[0], None
 
-    # Multiple poses - classify each
-    child_pose = None
+    # Score each pose with combined position + temporal continuity
+    pose_scores: List[Tuple[float, int, str]] = []  # (score, index, classification)
+
+    for i, lms in enumerate(poses):
+        bbox, _ = bbox_from_pose_landmarks(lms, min_vis=0.25)
+        classification = classify_pose_as_child_or_adult(lms, min_vis=0.25)
+
+        # Position score: centered = more likely child
+        if bbox is None:
+            position_score = 0.0
+        else:
+            cx = (bbox[0] + bbox[2]) / 2.0
+            cy = (bbox[1] + bbox[3]) / 2.0
+            # Higher score for centered positions
+            position_score = (1.0 - abs(cx - 0.5)) * (1.0 - abs(cy - 0.5) * 0.5)
+            # Penalty for edge positions (adult-like)
+            if cx <= 0.20 or cx >= 0.80 or cy <= 0.25:
+                position_score *= 0.3
+
+        # Temporal continuity score (IoU with previous child bbox)
+        if prev_child_bbox is not None and bbox is not None:
+            iou = bbox_iou(bbox, prev_child_bbox)
+        else:
+            iou = 0.0
+
+        # Combined score
+        if prev_child_bbox is not None and np.isfinite(prev_child_bbox[0]):
+            # Have temporal context - weight IoU heavily
+            combined_score = iou_weight * iou + (1 - iou_weight) * position_score
+        else:
+            # No temporal context - use position only
+            combined_score = position_score
+
+        pose_scores.append((combined_score, i, classification or "unknown"))
+
+    # Sort by combined score (descending)
+    pose_scores.sort(reverse=True, key=lambda x: x[0])
+
+    # Select child as highest scoring pose
+    child_pose = poses[pose_scores[0][1]]
     parent_pose = None
 
-    for lms in poses:
-        classification = classify_pose_as_child_or_adult(lms, min_vis=0.25)
-        if classification == "child" and child_pose is None:
-            child_pose = lms
-        elif classification == "adult" and parent_pose is None:
-            parent_pose = lms
+    # Select parent from remaining poses (prefer adult-classified)
+    for _score, idx, classification in pose_scores[1:]:
+        if classification == "adult":
+            parent_pose = poses[idx]
+            break
 
-    # Fallback: if no child found, use most centered pose
-    if child_pose is None:
-        scored: List[Tuple[float, int]] = []
-        for i, lms in enumerate(poses):
-            bbox, _ = bbox_from_pose_landmarks(lms, min_vis=0.25)
-            if bbox is None:
-                centered = 0.0
-            else:
-                cx = (bbox[0] + bbox[2]) / 2.0
-                centered = 1.0 - abs(cx - 0.5)
-            scored.append((centered, i))
-        scored.sort(reverse=True)
-        child_pose = poses[scored[0][1]]
-        if len(scored) > 1 and parent_pose is None:
-            parent_pose = poses[scored[1][1]]
+    # If no adult found, use second-best pose as parent
+    if parent_pose is None and len(pose_scores) > 1:
+        parent_pose = poses[pose_scores[1][1]]
 
     return child_pose, parent_pose
 
@@ -428,8 +524,8 @@ def interpolate_short_gaps(
         if not np.isfinite(result[before_idx, 0]) or not np.isfinite(result[after_idx, 0]):
             continue
 
-        # Linear interpolation for each coordinate
-        for col in range(5):
+        # Linear interpolation for coordinates only (not confidence)
+        for col in range(4):  # only x0, y0, x1, y1
             v0 = result[before_idx, col]
             v1 = result[after_idx, col]
             t0 = t_sec[before_idx]
@@ -441,6 +537,10 @@ def interpolate_short_gaps(
                 else:
                     alpha = 0.5
                 result[i, col] = v0 + alpha * (v1 - v0)
+
+        # Set confidence to 0.0 for interpolated frames (not real detections)
+        for i in range(gap_start, gap_end):
+            result[i, 4] = 0.0
 
     return result
 
@@ -532,6 +632,10 @@ class TracksArrays:
     parent_bbox: np.ndarray = field(default_factory=lambda: np.zeros((0, 5), dtype=np.float32))  # (N,5) [x0,y0,x1,y1,conf]
     is_smoothed: bool = False
 
+    # Metadata for reproducibility
+    fps: float = 0.0
+    sample_every_n: int = 1
+
 
 def extract_tracks_arrays_for_video(
     video_path: str,
@@ -583,6 +687,9 @@ def extract_tracks_arrays_for_video(
     frames_used = 0
     frame_idx = 0
 
+    # Track previous child bbox for temporal continuity
+    prev_child_bbox: Optional[np.ndarray] = None
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -607,8 +714,10 @@ def extract_tracks_arrays_for_video(
         pose_res = pose_landmarker.detect(mp_image)
         poses = pose_res.pose_landmarks if pose_res and pose_res.pose_landmarks else []
 
-        # Choose child and parent poses
-        child_pose_raw, parent_pose_raw = choose_child_and_parent_poses(poses)
+        # Choose child and parent poses with temporal continuity
+        child_pose_raw, parent_pose_raw = choose_child_and_parent_poses(
+            poses, prev_child_bbox=prev_child_bbox
+        )
 
         # Convert to arrays
         pose_arr = _lm_list_to_xyzw(child_pose_raw, expected_n=33)
@@ -622,6 +731,8 @@ def extract_tracks_arrays_for_video(
             if bbox is not None:
                 child_bbox_arr[:4] = bbox
                 child_bbox_arr[4] = conf
+                # Update previous child bbox for temporal continuity
+                prev_child_bbox = child_bbox_arr.copy()
 
         if parent_pose_raw is not None:
             bbox, conf = bbox_from_pose_landmarks(parent_pose_raw, min_vis=0.35)
@@ -629,19 +740,31 @@ def extract_tracks_arrays_for_video(
                 parent_bbox_arr[:4] = bbox
                 parent_bbox_arr[4] = conf
 
-        # Hands
+        # Hands - associate with child by centroid-in-bbox
         lh_arr = np.full((21, 4), np.nan, dtype=np.float32)
         rh_arr = np.full((21, 4), np.nan, dtype=np.float32)
 
         if hand_landmarker is not None:
             hand_res = hand_landmarker.detect(mp_image)
             lh_raw, rh_raw, _hs = _split_hands(hand_res)
+
+            # Only assign hand to child if centroid is inside child_bbox
+            # If child_bbox is not valid, fall back to accepting any hand
+            child_bbox_valid = np.isfinite(child_bbox_arr[0])
+
             if lh_raw is not None:
-                lh_arr = _lm_list_to_xyzw(lh_raw, expected_n=21)
-                any_lh = True
+                lh_centroid = hand_centroid(lh_raw)
+                # Accept hand if: no valid child bbox, or centroid is inside child bbox
+                if not child_bbox_valid or (lh_centroid and point_in_bbox(lh_centroid, child_bbox_arr)):
+                    lh_arr = _lm_list_to_xyzw(lh_raw, expected_n=21)
+                    any_lh = True
+
             if rh_raw is not None:
-                rh_arr = _lm_list_to_xyzw(rh_raw, expected_n=21)
-                any_rh = True
+                rh_centroid = hand_centroid(rh_raw)
+                # Accept hand if: no valid child bbox, or centroid is inside child bbox
+                if not child_bbox_valid or (rh_centroid and point_in_bbox(rh_centroid, child_bbox_arr)):
+                    rh_arr = _lm_list_to_xyzw(rh_raw, expected_n=21)
+                    any_rh = True
 
         t_list.append(float(t_sec))
         pose_list.append(pose_arr)
@@ -664,6 +787,10 @@ def extract_tracks_arrays_for_video(
     lh = lh_full if any_lh else np.zeros((0, 21, 4), dtype=np.float32)
     rh = rh_full if any_rh else np.zeros((0, 21, 4), dtype=np.float32)
 
+    # Save raw bboxes for quality computation (before smoothing)
+    raw_child_bbox = child_bbox.copy() if child_bbox.size > 0 else child_bbox
+    raw_parent_bbox = parent_bbox.copy() if parent_bbox.size > 0 else parent_bbox
+
     # Apply smoothing and gap handling
     is_smoothed = False
     if smoothing_config is not None and smoothing_config.enabled and child_bbox.size > 0:
@@ -679,6 +806,9 @@ def extract_tracks_arrays_for_video(
             child_bbox = smooth_bbox_ema(child_bbox, alpha=smoothing_config.ema_alpha)
         # kalman can be added here later
 
+        # Clip bboxes to [0,1] after smoothing
+        child_bbox[:, :4] = np.clip(child_bbox[:, :4], 0.0, 1.0)
+
         # Same for parent if detected
         if parent_bbox.size > 0 and np.isfinite(parent_bbox[:, 0]).any():
             parent_detected = np.isfinite(parent_bbox[:, 0])
@@ -686,6 +816,8 @@ def extract_tracks_arrays_for_video(
             parent_bbox = interpolate_short_gaps(parent_bbox, parent_gaps, t)
             if smoothing_config.method == "ema":
                 parent_bbox = smooth_bbox_ema(parent_bbox, alpha=smoothing_config.ema_alpha)
+            # Clip parent bboxes to [0,1] after smoothing
+            parent_bbox[:, :4] = np.clip(parent_bbox[:, :4], 0.0, 1.0)
 
         is_smoothed = True
 
@@ -697,9 +829,11 @@ def extract_tracks_arrays_for_video(
         child_bbox=child_bbox,
         parent_bbox=parent_bbox,
         is_smoothed=is_smoothed,
+        fps=fps,
+        sample_every_n=sample_every_n,
     )
 
-    # Compute quality report
+    # Compute quality report on RAW detections (before smoothing/interpolation)
     quality_report = None
     if compute_quality:
         video_info = {
@@ -708,7 +842,7 @@ def extract_tracks_arrays_for_video(
             "height": height,
             "duration_sec": float(t[-1] - t[0]) if len(t) > 1 else 0.0,
         }
-        quality_report = compute_quality_report(t, child_bbox, parent_bbox, video_info)
+        quality_report = compute_quality_report(t, raw_child_bbox, raw_parent_bbox, video_info)
 
     return tracks, quality_report
 
@@ -727,6 +861,9 @@ def save_tracks_npz(out_path: Path, arr: TracksArrays) -> None:
         child_bbox=arr.child_bbox,
         parent_bbox=arr.parent_bbox,
         is_smoothed=np.array([arr.is_smoothed]),  # store as array for NPZ compatibility
+        # Metadata for reproducibility
+        fps=np.array([arr.fps]),
+        sample_every_n=np.array([arr.sample_every_n]),
     )
 
 
@@ -740,7 +877,7 @@ TASK_TO_COL = {
 }
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(
         description="Export per-video landmarks + bboxes to NPZ for feature extraction."
     )

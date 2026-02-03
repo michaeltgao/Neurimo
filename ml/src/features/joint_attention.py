@@ -1,21 +1,40 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Pose landmark indices
+# Pose landmark indices (MediaPipe)
 POSE_NOSE = 0
+POSE_L_SHOULDER = 11
+POSE_R_SHOULDER = 12
 
 # Response detection config
 RESPONSE_WINDOW_SEC = 3.0  # How long after cue to look for response
-HEAD_TURN_THRESHOLD = 0.03  # Minimum nose_x change to count as response (normalized units)
+HEAD_TURN_THRESHOLD = 0.04  # Minimum head_signal change to count as response (normalized units)
+MIN_VISIBILITY = 0.35  # Minimum visibility for landmarks to be considered valid
+MIN_VALID_FRACTION = 0.3  # Minimum fraction of valid samples in response window
 
 
-def _load_tracks(tracks_dir: Path, child_id: str, task: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Load tracks and return (t_sec, nose_x) or None if missing."""
+@dataclass
+class TracksData:
+    """Container for loaded track data with visibility info."""
+    t_sec: np.ndarray  # (N,) timestamps
+    head_signal: np.ndarray  # (N,) normalized head orientation (nose_x - shoulder_midpoint_x)
+    valid_mask: np.ndarray  # (N,) bool mask where landmarks are visible
+
+
+def _load_tracks(tracks_dir: Path, child_id: str, task: str) -> Optional[TracksData]:
+    """
+    Load tracks and compute normalized head orientation signal.
+
+    Returns TracksData with:
+        - head_signal: nose_x - shoulder_midpoint_x (reduces whole-body translation confounds)
+        - valid_mask: frames where nose and both shoulders have sufficient visibility
+    """
     npz_path = tracks_dir / f"{child_id}_{task}.npz"
     if not npz_path.exists():
         return None
@@ -24,56 +43,91 @@ def _load_tracks(tracks_dir: Path, child_id: str, task: str) -> Optional[Tuple[n
     pose = data["pose"].astype(float)
     if pose.shape[0] == 0:
         return None
+
+    # Extract landmarks and visibility
     nose_x = pose[:, POSE_NOSE, 0]
-    return t_sec, nose_x
+    nose_vis = pose[:, POSE_NOSE, 3]
+    l_shoulder_x = pose[:, POSE_L_SHOULDER, 0]
+    l_shoulder_vis = pose[:, POSE_L_SHOULDER, 3]
+    r_shoulder_x = pose[:, POSE_R_SHOULDER, 0]
+    r_shoulder_vis = pose[:, POSE_R_SHOULDER, 3]
+
+    # Compute normalized head signal: nose relative to shoulder midpoint
+    # This removes whole-body translation confounds (leaning, etc.)
+    shoulder_mid_x = 0.5 * (l_shoulder_x + r_shoulder_x)
+    head_signal = nose_x - shoulder_mid_x
+
+    # Valid mask: require nose and both shoulders visible
+    valid_mask = (
+        (nose_vis >= MIN_VISIBILITY) &
+        (l_shoulder_vis >= MIN_VISIBILITY) &
+        (r_shoulder_vis >= MIN_VISIBILITY) &
+        np.isfinite(head_signal)
+    )
+
+    return TracksData(t_sec=t_sec, head_signal=head_signal, valid_mask=valid_mask)
 
 
 def _detect_head_turn_after_cue(
-    t_sec: np.ndarray,
-    nose_x: np.ndarray,
+    tracks: TracksData,
     cue_time: float,
     window_sec: float = RESPONSE_WINDOW_SEC,
     threshold: float = HEAD_TURN_THRESHOLD,
-) -> Tuple[bool, float]:
+    min_valid_frac: float = MIN_VALID_FRACTION,
+) -> Tuple[bool, float, float]:
     """
-    Detect if child turned head after a cue.
+    Detect if child turned head after a cue using normalized head signal.
+
+    Uses head_signal (nose_x - shoulder_midpoint_x) to reduce whole-body
+    translation confounds. Requires sufficient visible frames in window.
 
     Returns:
-        (responded, latency_sec) - latency is NaN if no response
+        (responded, latency_sec, signed_delta)
+        - latency is NaN if no response
+        - signed_delta indicates direction: positive = head moved right, negative = left
     """
+    t_sec = tracks.t_sec
+    head_signal = tracks.head_signal
+    valid_mask = tracks.valid_mask
+
     # Find samples in response window
-    mask = (t_sec >= cue_time) & (t_sec <= cue_time + window_sec)
-    if mask.sum() < 2:
-        return False, float("nan")
+    window_mask = (t_sec >= cue_time) & (t_sec <= cue_time + window_sec)
+    if window_mask.sum() < 2:
+        return False, float("nan"), float("nan")
 
-    window_t = t_sec[mask]
-    window_nose = nose_x[mask]
+    window_t = t_sec[window_mask]
+    window_signal = head_signal[window_mask]
+    window_valid = valid_mask[window_mask]
 
-    # Check for valid data
-    if not np.isfinite(window_nose).any():
-        return False, float("nan")
+    # Visibility gating: require minimum fraction of valid samples
+    valid_frac = window_valid.sum() / len(window_valid)
+    if valid_frac < min_valid_frac:
+        return False, float("nan"), float("nan")
 
-    # Interpolate NaNs
-    valid = np.isfinite(window_nose)
-    if valid.sum() < 2:
-        return False, float("nan")
+    # Only use valid samples
+    if window_valid.sum() < 2:
+        return False, float("nan"), float("nan")
 
-    window_nose_interp = np.interp(
-        window_t, window_t[valid], window_nose[valid]
-    )
+    valid_t = window_t[window_valid]
+    valid_signal = window_signal[window_valid]
 
-    # Compute cumulative head movement from start
-    baseline = window_nose_interp[0]
-    deltas = np.abs(window_nose_interp - baseline)
+    # Baseline from first valid sample after cue
+    baseline = valid_signal[0]
 
-    # Find first time delta exceeds threshold
-    response_idx = np.where(deltas >= threshold)[0]
+    # Compute signed deltas from baseline
+    deltas = valid_signal - baseline
+
+    # Find first time absolute delta exceeds threshold
+    abs_deltas = np.abs(deltas)
+    response_idx = np.where(abs_deltas >= threshold)[0]
     if len(response_idx) == 0:
-        return False, float("nan")
+        return False, float("nan"), float("nan")
 
     first_response = response_idx[0]
-    latency = max(0.0, window_t[first_response] - cue_time)
-    return True, float(latency)
+    latency = max(0.0, valid_t[first_response] - cue_time)
+    signed_delta = float(deltas[first_response])
+
+    return True, float(latency), signed_delta
 
 
 def _deduplicate_cues(times: np.ndarray, min_gap_sec: float = 1.0) -> np.ndarray:
@@ -89,25 +143,41 @@ def _deduplicate_cues(times: np.ndarray, min_gap_sec: float = 1.0) -> np.ndarray
 
 
 def _compute_post_cue_head_change(
-    t_sec: np.ndarray,
-    nose_x: np.ndarray,
+    tracks: TracksData,
     cue_time: float,
     window_sec: float = RESPONSE_WINDOW_SEC,
-) -> float:
-    """Compute magnitude of head turn after cue (max absolute delta from baseline)."""
-    mask = (t_sec >= cue_time) & (t_sec <= cue_time + window_sec)
-    if mask.sum() < 2:
-        return float("nan")
+) -> Tuple[float, float]:
+    """
+    Compute magnitude and direction of head turn after cue.
 
-    window_nose = nose_x[mask]
-    valid = np.isfinite(window_nose)
-    if valid.sum() < 2:
-        return float("nan")
+    Returns:
+        (max_abs_delta, signed_delta_at_max)
+        - max_abs_delta: maximum absolute change from baseline
+        - signed_delta_at_max: signed value at max change (positive = right, negative = left)
+    """
+    t_sec = tracks.t_sec
+    head_signal = tracks.head_signal
+    valid_mask = tracks.valid_mask
 
-    window_nose_clean = window_nose[valid]
-    baseline = window_nose_clean[0]
-    max_delta = float(np.max(np.abs(window_nose_clean - baseline)))
-    return max_delta
+    window_mask = (t_sec >= cue_time) & (t_sec <= cue_time + window_sec)
+    if window_mask.sum() < 2:
+        return float("nan"), float("nan")
+
+    window_signal = head_signal[window_mask]
+    window_valid = valid_mask[window_mask]
+
+    if window_valid.sum() < 2:
+        return float("nan"), float("nan")
+
+    valid_signal = window_signal[window_valid]
+    baseline = valid_signal[0]
+    deltas = valid_signal - baseline
+
+    max_idx = np.argmax(np.abs(deltas))
+    max_abs_delta = float(np.abs(deltas[max_idx]))
+    signed_delta = float(deltas[max_idx])
+
+    return max_abs_delta, signed_delta
 
 
 def extract_joint_attention_features(
@@ -149,9 +219,17 @@ def extract_joint_attention_features(
             ja_attention_response_latency_mean: Mean latency of attention responses (sec)
             ja_name_response_rate: Fraction of CALL_ATTENTION cues child responded to
             ja_name_response_latency_mean: Mean latency of name responses (sec)
-            ja_follow_point_rate: Fraction of point segments child followed
+            ja_follow_point_rate: Fraction of point segments child responded to (any movement)
+            ja_follow_point_correct_dir_rate: Fraction of responses in correct direction
             ja_follow_point_latency_mean: Mean latency of point following (sec)
             ja_post_point_head_change_mean: Mean head turn magnitude after points
+
+            # Paper-aligned features (autism identification study)
+            ja_response_latency_s: First response latency to name call (sec)
+            ja_parent_attempts: Total parent calling attempts (CALL_ATTENTION + LOOK)
+            ja_orient_success: Binary (1.0 if child oriented at least once, 0.0 otherwise)
+            ja_orient_latency_s: Latency to first successful orientation (sec, relative to cue)
+            ja_first_orient_time_s: Absolute timestamp of first orientation (sec from video start)
     """
     child_id_str = str(child_id)
     features: Dict[str, float] = {}
@@ -162,10 +240,13 @@ def extract_joint_attention_features(
         tracks_data = _load_tracks(tracks_dir, child_id_str, "joint_attention")
 
     # === Pointing features (adult-side) ===
-    point_child_df = point_events_df[
-        (point_events_df["child_id"].astype(str) == child_id_str)
-        & (point_events_df["task_type"] == "joint_attention")
-    ]
+    if len(point_events_df) > 0 and "child_id" in point_events_df.columns:
+        point_child_df = point_events_df[
+            (point_events_df["child_id"].astype(str) == child_id_str)
+            & (point_events_df["task_type"] == "joint_attention")
+        ]
+    else:
+        point_child_df = pd.DataFrame()
 
     if len(point_child_df) == 0:
         features.update({
@@ -194,7 +275,7 @@ def extract_joint_attention_features(
 
     # === Audio features (adult-side) ===
     audio_child_df = None
-    if audio_events_df is not None and len(audio_events_df) > 0:
+    if audio_events_df is not None and len(audio_events_df) > 0 and "child_id" in audio_events_df.columns:
         audio_child_df = audio_events_df[
             (audio_events_df["child_id"].astype(str) == child_id_str)
             & (audio_events_df["task_type"] == "joint_attention")
@@ -206,6 +287,8 @@ def extract_joint_attention_features(
             "ja_look_phrase_count": 0.0,
             "ja_audio_cue_count": 0.0,
             "ja_audio_cue_mean_confidence": float("nan"),
+            # Paper-aligned: parent attempts
+            "ja_parent_attempts": 0.0,
         })
         audio_child_df = pd.DataFrame(columns=["event_type", "t_start"])  # Empty with correct columns for response analysis
     else:
@@ -222,6 +305,8 @@ def extract_joint_attention_features(
             "ja_look_phrase_count": look_phrase_count,
             "ja_audio_cue_count": audio_cue_count,
             "ja_audio_cue_mean_confidence": mean_confidence,
+            # Paper-aligned: parent attempts (same as audio_cue_count)
+            "ja_parent_attempts": audio_cue_count,
         })
 
     # === Response features (child behavior) ===
@@ -233,22 +318,32 @@ def extract_joint_attention_features(
             "ja_name_response_rate": float("nan"),
             "ja_name_response_latency_mean": float("nan"),
             "ja_follow_point_rate": float("nan"),
+            "ja_follow_point_correct_dir_rate": float("nan"),
             "ja_follow_point_latency_mean": float("nan"),
             "ja_post_point_head_change_mean": float("nan"),
+            # Paper-aligned features
+            "ja_response_latency_s": float("nan"),
+            "ja_orient_success": float("nan"),
+            "ja_orient_latency_s": float("nan"),
+            "ja_first_orient_time_s": float("nan"),
         })
     else:
-        t_sec, nose_x = tracks_data
-
         # Attention response analysis (all audio cues: CALL_ATTENTION + LOOK)
         all_cue_times = _deduplicate_cues(audio_child_df["t_start"].to_numpy(dtype=float))
 
         attention_responses = []
         attention_latencies = []
+        first_orient_latency = float("nan")  # Latency relative to first successful cue
+        first_orient_time = float("nan")  # Absolute timestamp of first orient
         for cue_time in all_cue_times:
-            responded, latency = _detect_head_turn_after_cue(t_sec, nose_x, cue_time)
+            responded, latency, _ = _detect_head_turn_after_cue(tracks_data, cue_time)
             attention_responses.append(responded)
             if responded:
                 attention_latencies.append(latency)
+                # Capture first successful orient (paper-aligned)
+                if np.isnan(first_orient_latency):
+                    first_orient_latency = latency
+                    first_orient_time = cue_time + latency
 
         if len(attention_responses) > 0:
             attention_response_rate = float(np.mean(attention_responses))
@@ -260,17 +355,27 @@ def extract_joint_attention_features(
         else:
             attention_response_latency_mean = float("nan")
 
-        # Name response analysis (CALL_ATTENTION only)
+        # Paper-aligned: binary orient success (1.0 if any response, 0.0 otherwise)
+        orient_success = 1.0 if len(attention_latencies) > 0 else 0.0
+
+        # Name response analysis (CALL_ATTENTION only, with larger dedup gap)
         call_attention_df = audio_child_df[audio_child_df["event_type"] == "CALL_ATTENTION"]
-        name_cue_times = _deduplicate_cues(call_attention_df["t_start"].to_numpy(dtype=float))
+        name_cue_times = _deduplicate_cues(
+            call_attention_df["t_start"].to_numpy(dtype=float),
+            min_gap_sec=2.0  # Larger gap for name calls (repeated calls are common)
+        )
 
         name_responses = []
         name_latencies = []
+        first_name_response_latency = float("nan")  # Paper-aligned: first response
         for cue_time in name_cue_times:
-            responded, latency = _detect_head_turn_after_cue(t_sec, nose_x, cue_time)
+            responded, latency, _ = _detect_head_turn_after_cue(tracks_data, cue_time)
             name_responses.append(responded)
             if responded:
                 name_latencies.append(latency)
+                # Capture first successful response latency (paper-aligned)
+                if np.isnan(first_name_response_latency):
+                    first_name_response_latency = latency
 
         if len(name_responses) > 0:
             name_response_rate = float(np.mean(name_responses))
@@ -282,26 +387,46 @@ def extract_joint_attention_features(
         else:
             name_response_latency_mean = float("nan")
 
-        # Point following analysis (use smaller gap since pointing segments are discrete events)
-        point_cue_times = _deduplicate_cues(point_child_df["t_start"].to_numpy(dtype=float), min_gap_sec=0.5)
-
+        # Point following analysis with directional matching
+        # Use angle_deg to check if child turned in the correct direction
         point_responses = []
+        point_correct_direction = []
         point_latencies = []
         point_head_changes = []
-        for point_time in point_cue_times:
-            responded, latency = _detect_head_turn_after_cue(t_sec, nose_x, point_time)
+
+        for _, row in point_child_df.iterrows():
+            point_time = float(row["t_start"])
+            point_angle = float(row.get("angle_deg", 90.0))  # Default to center if missing
+
+            responded, latency, signed_delta = _detect_head_turn_after_cue(tracks_data, point_time)
             point_responses.append(responded)
+
             if responded:
                 point_latencies.append(latency)
 
-            head_change = _compute_post_cue_head_change(t_sec, nose_x, point_time)
-            if np.isfinite(head_change):
-                point_head_changes.append(head_change)
+                # Directional matching: check if head moved toward point direction
+                # Point angle convention: 0=right, 180=left (in image coords)
+                # Head signal: positive = head moved right, negative = left
+                # If point is to right (angle < 90), expect positive signed_delta
+                # If point is to left (angle > 90), expect negative signed_delta
+                expected_direction = 1.0 if point_angle < 90 else -1.0
+                actual_direction = 1.0 if signed_delta > 0 else -1.0
+                correct_dir = (expected_direction == actual_direction)
+                point_correct_direction.append(correct_dir)
+
+            head_change_abs, _ = _compute_post_cue_head_change(tracks_data, point_time)
+            if np.isfinite(head_change_abs):
+                point_head_changes.append(head_change_abs)
 
         if len(point_responses) > 0:
             follow_point_rate = float(np.mean(point_responses))
         else:
             follow_point_rate = float("nan")
+
+        if len(point_correct_direction) > 0:
+            follow_point_correct_dir_rate = float(np.mean(point_correct_direction))
+        else:
+            follow_point_correct_dir_rate = float("nan")
 
         if len(point_latencies) > 0:
             follow_point_latency_mean = float(np.mean(point_latencies))
@@ -319,8 +444,14 @@ def extract_joint_attention_features(
             "ja_name_response_rate": name_response_rate,
             "ja_name_response_latency_mean": name_response_latency_mean,
             "ja_follow_point_rate": follow_point_rate,
+            "ja_follow_point_correct_dir_rate": follow_point_correct_dir_rate,
             "ja_follow_point_latency_mean": follow_point_latency_mean,
             "ja_post_point_head_change_mean": post_point_head_change_mean,
+            # Paper-aligned features (autism identification study)
+            "ja_response_latency_s": first_name_response_latency,
+            "ja_orient_success": orient_success,
+            "ja_orient_latency_s": first_orient_latency,
+            "ja_first_orient_time_s": first_orient_time,
         })
 
     return features
