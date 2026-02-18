@@ -1,5 +1,11 @@
 import { api } from "./client";
 
+export type LikertValue = "always" | "often" | "sometimes" | "rarely" | "never";
+
+export type QuestionnaireResponses = Record<string, LikertValue>;
+
+export type FamilyHistoryData = Record<string, Record<string, boolean>>;
+
 export type Questionnaire = {
   id?: number;
   visit_id?: number;
@@ -11,7 +17,17 @@ export type Questionnaire = {
   dysmorphic_features: boolean;
   macrocephaly: boolean;
   microcephaly: boolean;
+  responses?: QuestionnaireResponses | null;
+  family_history?: FamilyHistoryData | null;
   notes?: string | null;
+};
+
+export type ExplanationsByTask = {
+  joint_attention: string[];
+  imitation: string[];
+  free_play: string[];
+  questionnaire: string[];
+  general: string[];
 };
 
 export type Report = {
@@ -21,13 +37,18 @@ export type Report = {
     visit_date: string;
     age_months: number;
   };
-  asd_risk_bucket: "low" | "medium" | "med-high" | "high" | string;
+  asd_risk_bucket: "low" | "moderate" | "moderate-high" | "high" | string;
+  risk_score: number | null;
   explanations: string[];
+  explanations_by_task?: ExplanationsByTask | null;
   prior_visits: {
     id: number;
     age_months: number;
     visit_date: string;
     asd_risk_bucket: string;
+    risk_score: number | null;
+    visit_number: number;
+    is_current: boolean;
   }[];
 };
 

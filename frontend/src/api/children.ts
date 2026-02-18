@@ -16,6 +16,11 @@ export type ChildCreate = {
   clinic_id?: string;
 };
 
+export type ChildUpdate = {
+  pseudo_id?: string;
+  birthdate?: string; // YYYY-MM-DD
+};
+
 export async function listChildren(): Promise<Child[]> {
   const res = await api.get<Child[]>("/children");
   return res.data;
@@ -28,6 +33,11 @@ export async function createChild(payload: ChildCreate): Promise<Child> {
 
 export async function getChild(childId: number): Promise<Child> {
   const res = await api.get<Child>(`/children/${childId}`);
+  return res.data;
+}
+
+export async function updateChild(childId: number, payload: ChildUpdate): Promise<Child> {
+  const res = await api.patch<Child>(`/children/${childId}`, payload);
   return res.data;
 }
 

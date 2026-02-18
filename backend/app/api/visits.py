@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.visit import Visit
 from app.models.child import Child
-from app.schemas.visit import VisitCreate, VisitOut
+from app.schemas.visit import VisitCreate, VisitUpdate, VisitOut
 
 router = APIRouter(tags=["visits"])
 
@@ -24,6 +24,30 @@ def get_visit(visit_id: str, db: Session = Depends(get_db)):
     visit = db.query(Visit).filter(Visit.child_id == child_id, Visit.visit_number == visit_number).first()
     if not visit:
         raise HTTPException(status_code=404, detail="Visit not found")
+    return visit
+
+@router.patch("/visits/{visit_id}", response_model=VisitOut)
+def update_visit(visit_id: str, payload: VisitUpdate, db: Session = Depends(get_db)):
+    parts = visit_id.split("-")
+    if len(parts) != 2:
+        raise HTTPException(status_code=400, detail="Invalid visit ID format. Expected: child_id-visit_number")
+
+    try:
+        child_id = int(parts[0])
+        visit_number = int(parts[1])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid visit ID format. Expected: child_id-visit_number")
+
+    visit = db.query(Visit).filter(Visit.child_id == child_id, Visit.visit_number == visit_number).first()
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found")
+
+    update_data = payload.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(visit, field, value)
+
+    db.commit()
+    db.refresh(visit)
     return visit
 
 @router.post("/children/{child_id}/visits", response_model=VisitOut)
@@ -50,3 +74,25 @@ def list_visits(child_id: int, db: Session = Depends(get_db)):
         .order_by(Visit.visit_date.asc())
         .all()
     )
+
+
+@router.delete("/visits/{visit_id}", status_code=204)
+def delete_visit(visit_id: str, db: Session = Depends(get_db)):
+    # Parse visit_id in format "child_id-visit_number" (e.g., "21-1")
+    parts = visit_id.split("-")
+    if len(parts) != 2:
+        raise HTTPException(status_code=400, detail="Invalid visit ID format. Expected: child_id-visit_number")
+
+    try:
+        child_id = int(parts[0])
+        visit_number = int(parts[1])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid visit ID format. Expected: child_id-visit_number")
+
+    visit = db.query(Visit).filter(Visit.child_id == child_id, Visit.visit_number == visit_number).first()
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found")
+
+    db.delete(visit)
+    db.commit()
+    return None

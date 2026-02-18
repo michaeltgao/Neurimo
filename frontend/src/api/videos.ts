@@ -62,3 +62,124 @@ export function getVideoStaticUrl(storagePath: string): string {
 
   return `${base}/static/${rel}`;
 }
+
+// Guided Review Data types (matching backend output)
+export type GuidedReviewData = {
+  videoId: number;
+  videoUrl: string;
+  durationMs: number;
+  taskTypeDisplay: string;
+  ageBucket: string;
+  riskBucket: "low" | "low-moderate" | "moderate" | "moderate-high" | "elevated" | "high";
+  flaggedMoments: FlaggedMoment[];
+  quality: VideoQualityMetrics;
+  summary: AnnotationSummary;
+  keyDrivers: KeyDriver[];
+};
+
+export type FlaggedMoment = {
+  id: string;
+  pauseAtMs: number;
+  windowStartMs: number;
+  windowEndMs: number;
+  markerColor: string;
+  expected: {
+    type: string;
+    description: string;
+  };
+  observed: {
+    status: string;
+    latencyMs: number | null;
+    description: string;
+  };
+  pauseCard: PauseCard;
+};
+
+export type PauseCard = {
+  status: string;
+  statusIcon: string;
+  statusLabel: string;
+  statusColor: string;
+  prompt: {
+    type: string;
+    timestamp: string;
+    confidence: number;
+  };
+  expectation: {
+    description: string;
+    windowDuration: string;
+  };
+  observation: {
+    latencyDisplay: string | null;
+    description: string;
+  };
+  tracking: {
+    quality: string;
+    qualityPct: number;
+    faceVisible: boolean;
+  };
+  flagIndex: number;
+  flagTotal: number;
+};
+
+export type VideoQualityMetrics = {
+  overallQuality: "good" | "medium" | "poor";
+  faceVisibilityPct: number;
+};
+
+export type AnnotationSummary = {
+  nameResponse?: {
+    observed: number;
+    delayed: number;
+    notObserved: number;
+    uncertain: number;
+    total: number;
+    clinicalNote: string;
+  };
+  jointAttention?: {
+    observed: number;
+    delayed: number;
+    notObserved: number;
+    uncertain: number;
+    total: number;
+    clinicalNote: string;
+  };
+  imitation?: {
+    full: number;
+    partial: number;
+    none: number;
+    rateInclusive: number;
+    clinicalNote: string;
+  };
+  freePlay?: {
+    socialLooks: number;
+    spontaneousPoints: number;
+    toyTransitions: number;
+    clinicalNote: string;
+  };
+};
+
+export type KeyDriver = {
+  id: string;
+  label: string;
+  severity: "high" | "medium" | "low";
+  color?: string;  // Color that scales with ML risk level
+  count?: number;
+};
+
+export async function getGuidedReviewData(videoId: number, durationMs: number): Promise<GuidedReviewData> {
+  const res = await api.get<GuidedReviewData>(`/videos/${videoId}/guided-review`, {
+    params: { duration_ms: durationMs },
+  });
+  return res.data;
+}
+
+// Overlay Data types (for real-time video annotation overlays)
+import type { OverlayData } from "../types/overlayTypes";
+
+export async function getOverlayData(videoId: number, durationMs: number): Promise<OverlayData> {
+  const res = await api.get<OverlayData>(`/videos/${videoId}/overlay-data`, {
+    params: { duration_ms: durationMs },
+  });
+  return res.data;
+}

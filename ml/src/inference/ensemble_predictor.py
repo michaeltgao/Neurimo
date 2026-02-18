@@ -18,12 +18,16 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
 import joblib  # type: ignore
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
+from scipy.special import expit  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 
 class EnsemblePredictor:
@@ -82,6 +86,7 @@ class EnsemblePredictor:
 
         self._models: Dict[str, List[Any]] = {}
         self._feature_cols: Dict[str, List[str]] = {}
+        self._calibration: Dict[str, float] | None = None
         self._loaded = False
 
     def load(self) -> "EnsemblePredictor":
@@ -115,6 +120,16 @@ class EnsemblePredictor:
 
             self._models[model_name] = fold_models
             print(f"  Loaded {model_name}: {len(fold_models)} fold(s), {len(self._feature_cols[model_name])} features")
+
+        # Load Platt scaling calibration if available
+        cal_path = self.models_dir / "ensemble_calibration.json"
+        if cal_path.exists():
+            with open(cal_path, "r") as f:
+                cal = json.load(f)
+            self._calibration = {"a": cal["a"], "b": cal["b"]}
+            print(f"  Loaded calibration: sigmoid({cal['a']:.2f} * raw + {cal['b']:.2f})")
+        else:
+            print("  No calibration file found — using raw predictions")
 
         self._loaded = True
         print(f"Ensemble loaded: {len(self._models)} models")
@@ -173,7 +188,16 @@ class EnsemblePredictor:
             model_preds[model_name] = np.mean(fold_preds, axis=0)
 
         # Simple average ensemble (equal 1/3 weights)
-        ensemble_pred = np.mean(list(model_preds.values()), axis=0)
+        ensemble_raw = np.mean(list(model_preds.values()), axis=0)
+        logger.info(f"  Ensemble raw: {ensemble_raw[0]:.4f}")
+
+        # Apply Platt scaling calibration
+        if self._calibration is not None:
+            a, b = self._calibration["a"], self._calibration["b"]
+            ensemble_pred = expit(a * ensemble_raw + b)
+            logger.info(f"  Ensemble calibrated: {ensemble_pred[0]:.4f}")
+        else:
+            ensemble_pred = ensemble_raw
 
         return ensemble_pred
 
@@ -188,7 +212,7 @@ class EnsemblePredictor:
             Dict (single sample) or DataFrame (batch) with columns:
             - probability: float [0, 1]
             - prediction: int (0 or 1)
-            - risk_level: str ("low", "medium", "high")
+            - risk_level: str ("low", "moderate", "moderate-high", "high")
         """
         proba = self.predict_proba(features)
 
@@ -210,11 +234,19 @@ class EnsemblePredictor:
         return results
 
     def _get_risk_level(self, probability: float) -> str:
-        """Convert probability to risk level."""
-        if probability < 0.3:
+        """Convert probability to risk level (4 buckets, score 0-100).
+
+        Uses the rounded display score to ensure bucket labels match
+        what users see (e.g., 75 displayed = moderate-high, 76+ = high).
+        """
+        # low: 0-25, moderate: 26-50, moderate-high: 51-75, high: 76-100
+        score = round(probability * 100)
+        if score <= 25:
             return "low"
-        elif probability < 0.7:
-            return "medium"
+        elif score <= 50:
+            return "moderate"
+        elif score <= 75:
+            return "moderate-high"
         else:
             return "high"
 

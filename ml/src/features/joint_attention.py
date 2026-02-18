@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -455,3 +455,156 @@ def extract_joint_attention_features(
         })
 
     return features
+
+
+def extract_response_outcomes(
+    child_id: str,
+    point_events_df: pd.DataFrame,
+    audio_events_df: Optional[pd.DataFrame] = None,
+    tracks_dir: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Extract per-event response outcomes for guided review.
+
+    This function uses the SAME detection logic as extract_joint_attention_features
+    to ensure consistency between ML features and guided review display.
+
+    Args:
+        child_id: Child identifier
+        point_events_df: DataFrame from pointing.py output
+        audio_events_df: DataFrame from audio_events.py output
+        tracks_dir: Directory containing {child_id}_joint_attention.npz
+
+    Returns:
+        List of dicts, each containing:
+            - cue_type: "audio" or "point"
+            - event_type: "CALL_ATTENTION", "LOOK", or "POINT"
+            - t_start_sec: Cue start time
+            - t_end_sec: Cue end time (for points)
+            - matched_phrase: For audio events
+            - point_angle_deg: For pointing events
+            - responded: bool
+            - latency_ms: Response latency (None if no response)
+            - status: "observed", "delayed", "not_observed", or "uncertain"
+    """
+    child_id_str = str(child_id)
+    outcomes: List[Dict[str, Any]] = []
+
+    # Load child tracks if available
+    tracks_data = None
+    if tracks_dir is not None:
+        tracks_data = _load_tracks(tracks_dir, child_id_str, "joint_attention")
+
+    if tracks_data is None:
+        # No tracking data - mark all as uncertain
+        if audio_events_df is not None and len(audio_events_df) > 0:
+            audio_child_df = audio_events_df[
+                (audio_events_df["child_id"].astype(str) == child_id_str)
+                & (audio_events_df["task_type"] == "joint_attention")
+            ]
+            for _, row in audio_child_df.iterrows():
+                outcomes.append({
+                    "cue_type": "audio",
+                    "event_type": row["event_type"],
+                    "t_start_sec": float(row["t_start"]),
+                    "t_end_sec": float(row["t_end"]),
+                    "matched_phrase": row.get("matched_phrase"),
+                    "point_angle_deg": None,
+                    "responded": False,
+                    "latency_ms": None,
+                    "status": "uncertain",
+                })
+
+        if len(point_events_df) > 0 and "child_id" in point_events_df.columns:
+            point_child_df = point_events_df[
+                (point_events_df["child_id"].astype(str) == child_id_str)
+                & (point_events_df["task_type"] == "joint_attention")
+            ]
+            for _, row in point_child_df.iterrows():
+                outcomes.append({
+                    "cue_type": "point",
+                    "event_type": "POINT",
+                    "t_start_sec": float(row["t_start"]),
+                    "t_end_sec": float(row["t_end"]),
+                    "matched_phrase": None,
+                    "point_angle_deg": float(row.get("point_angle_deg", row.get("angle_deg", 90.0))),
+                    "responded": False,
+                    "latency_ms": None,
+                    "status": "uncertain",
+                })
+
+        return outcomes
+
+    # Delayed threshold (same as used in guided review)
+    DELAYED_THRESHOLD_MS = 1500.0
+
+    # Process audio events
+    if audio_events_df is not None and len(audio_events_df) > 0 and "child_id" in audio_events_df.columns:
+        audio_child_df = audio_events_df[
+            (audio_events_df["child_id"].astype(str) == child_id_str)
+            & (audio_events_df["task_type"] == "joint_attention")
+        ]
+
+        for _, row in audio_child_df.iterrows():
+            cue_time = float(row["t_start"])
+            responded, latency, _ = _detect_head_turn_after_cue(tracks_data, cue_time)
+
+            latency_ms = latency * 1000 if responded and not np.isnan(latency) else None
+
+            if not responded:
+                status = "not_observed"
+            elif latency_ms is not None and latency_ms > DELAYED_THRESHOLD_MS:
+                status = "delayed"
+            else:
+                status = "observed"
+
+            outcomes.append({
+                "cue_type": "audio",
+                "event_type": row["event_type"],
+                "t_start_sec": cue_time,
+                "t_end_sec": float(row["t_end"]),
+                "matched_phrase": row.get("matched_phrase"),
+                "point_angle_deg": None,
+                "responded": responded,
+                "latency_ms": latency_ms,
+                "status": status,
+            })
+
+    # Process pointing events
+    if len(point_events_df) > 0 and "child_id" in point_events_df.columns:
+        point_child_df = point_events_df[
+            (point_events_df["child_id"].astype(str) == child_id_str)
+            & (point_events_df["task_type"] == "joint_attention")
+        ]
+
+        for _, row in point_child_df.iterrows():
+            point_time = float(row["t_start"])
+            point_angle = float(row.get("point_angle_deg", row.get("angle_deg", 90.0)))
+
+            responded, latency, _ = _detect_head_turn_after_cue(tracks_data, point_time)
+
+            latency_ms = latency * 1000 if responded and not np.isnan(latency) else None
+
+            if not responded:
+                status = "not_observed"
+            elif latency_ms is not None and latency_ms > DELAYED_THRESHOLD_MS:
+                status = "delayed"
+            else:
+                status = "observed"
+
+            outcomes.append({
+                "cue_type": "point",
+                "event_type": "POINT",
+                "t_start_sec": point_time,
+                "t_end_sec": float(row["t_end"]),
+                "matched_phrase": None,
+                "point_angle_deg": point_angle,
+                "responded": responded,
+                "latency_ms": latency_ms,
+                "status": status,
+            })
+
+    # Sort by time
+    outcomes.sort(key=lambda x: x["t_start_sec"])
+
+    return outcomes

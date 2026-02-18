@@ -10,7 +10,7 @@ Features are prefixed with 'fp_' for free play task.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -609,3 +609,94 @@ def extract_free_play_features(
     features.update(coord_features)
 
     return features
+
+
+# Thresholds for flagging behaviors (consistent with clinical assessment)
+REPETITIVE_MOTION_THRESHOLD = 0.15  # Flag if >15% of time in repetitive motion
+HAND_TO_FACE_THRESHOLD = 0.10       # Flag if >10% of time hand-to-face
+
+
+def extract_free_play_outcomes(
+    child_id: str,
+    fp_summary_df: pd.DataFrame,
+    fp_events_df: Optional[pd.DataFrame] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Extract per-event outcomes for guided review consistency.
+
+    Uses the SAME threshold logic as feature extraction to determine which
+    behavioral events should be flagged, ensuring consistency between
+    dashboard explanations and video replay.
+
+    Args:
+        child_id: Child identifier
+        fp_summary_df: DataFrame from free_play_events.py output
+        fp_events_df: Optional events DataFrame for individual events
+
+    Returns:
+        List of dicts with outcome info for each flagged event:
+            - task_type: "free_play"
+            - event_type: "PERIODIC_MOTION", "HAND_TO_FACE", etc.
+            - t_start_sec: Event start time
+            - t_end_sec: Event end time
+            - flagged: Whether this event is part of a concerning pattern
+            - status: "flagged" if concerning, "normal" otherwise
+    """
+    child_id_str = str(child_id)
+    outcomes: List[Dict[str, Any]] = []
+
+    # Determine which behavior types are flagged based on aggregate metrics
+    flagged_types: set[str] = set()
+
+    # Get summary for this child
+    if len(fp_summary_df) > 0 and "child_id" in fp_summary_df.columns:
+        child_df = fp_summary_df[
+            (fp_summary_df["child_id"].astype(str) == child_id_str)
+            & (fp_summary_df["task_type"] == "free_play")
+        ]
+    else:
+        child_df = pd.DataFrame()
+
+    if len(child_df) > 0:
+        row = child_df.iloc[0]
+
+        # Check repetitive motion threshold
+        rep_motion_frac = _safe_float(row.get("repetitive_motion_time_frac", 0), default=0)
+        if rep_motion_frac > REPETITIVE_MOTION_THRESHOLD:
+            flagged_types.add("PERIODIC_MOTION")
+
+        # Check hand-to-face threshold
+        htf_frac = _safe_float(row.get("hand_to_face_time_frac", 0), default=0)
+        if htf_frac > HAND_TO_FACE_THRESHOLD:
+            flagged_types.add("HAND_TO_FACE")
+
+    # If no events data or no flagged types, return empty
+    if fp_events_df is None or len(fp_events_df) == 0 or not flagged_types:
+        return outcomes
+
+    # Filter events to this child
+    child_events = fp_events_df[
+        (fp_events_df["child_id"].astype(str) == child_id_str)
+        & (fp_events_df["task_type"] == "free_play")
+    ]
+
+    if len(child_events) == 0:
+        return outcomes
+
+    # Create outcomes for each event of flagged types
+    event_type_col = child_events["event_type"].astype(str)
+
+    for _, event in child_events.iterrows():
+        event_type = str(event.get("event_type", "")).upper()
+
+        if event_type in flagged_types:
+            outcomes.append({
+                "task_type": "free_play",
+                "event_type": event_type,
+                "t_start_sec": float(event.get("t_start", 0)),
+                "t_end_sec": float(event.get("t_end", 0)),
+                "flagged": True,
+                "status": "flagged",
+            })
+
+    return outcomes

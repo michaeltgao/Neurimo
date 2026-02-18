@@ -9,6 +9,8 @@ class QuestionnaireCreate(BaseModel):
     dysmorphic_features: bool = False
     macrocephaly: bool = False
     microcephaly: bool = False
+    responses: dict | None = None
+    family_history: dict | None = None
     notes: str | None = None
 
 class QuestionnaireOut(QuestionnaireCreate):

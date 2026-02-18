@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -260,3 +260,131 @@ def extract_imitation_features(
     features["imit_response_latency_sec"] = response_latency
 
     return features
+
+
+# Delayed threshold for imitation responses (same as guided_review)
+DELAYED_THRESHOLD_MS = 1500
+
+
+def extract_imitation_outcomes(
+    child_id: str,
+    imit_summary_df: pd.DataFrame,
+    imit_events_df: Optional[pd.DataFrame] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Extract per-demo response outcomes for guided review consistency.
+
+    Uses the SAME detection logic as feature extraction (summary-level detection)
+    to ensure consistency between dashboard explanations and video replay.
+
+    Args:
+        child_id: Child identifier
+        imit_summary_df: DataFrame from imitation.py output (imit_summary.csv)
+        imit_events_df: Optional events DataFrame for demo timing
+
+    Returns:
+        List of dicts with outcome info for each parent demo:
+            - action_type: "CLAP" or "ARMS_UP"
+            - event_type: "PARENT_CLAP" or "PARENT_ARMS_UP"
+            - t_sec: Demo timestamp
+            - responded: Whether child responded (from summary)
+            - latency_ms: Response latency if responded
+            - status: "observed", "delayed", or "not_observed"
+    """
+    child_id_str = str(child_id)
+    outcomes: List[Dict[str, Any]] = []
+
+    # Get summary for this child
+    if len(imit_summary_df) > 0 and "child_id" in imit_summary_df.columns:
+        child_df = imit_summary_df[
+            (imit_summary_df["child_id"].astype(str) == child_id_str)
+            & (imit_summary_df["task_type"] == "imitation")
+        ]
+    else:
+        return outcomes
+
+    if len(child_df) == 0:
+        return outcomes
+
+    row = child_df.iloc[0]
+
+    # Get detection results from summary
+    clap_demo_present = _is_present(row.get("clap_demo_present")) and str(row.get("clap_demo_present")).lower() not in ("false", "0")
+    clap_response_present = _is_present(row.get("clap_response_present")) and str(row.get("clap_response_present")).lower() not in ("false", "0")
+    clap_latency_sec = float(row.get("clap_latency_sec")) if _is_present(row.get("clap_latency_sec")) else None
+
+    arms_demo_present = _is_present(row.get("arms_demo_present")) and str(row.get("arms_demo_present")).lower() not in ("false", "0")
+    arms_response_present = _is_present(row.get("arms_response_present")) and str(row.get("arms_response_present")).lower() not in ("false", "0")
+    arms_latency_sec = float(row.get("arms_latency_sec")) if _is_present(row.get("arms_latency_sec")) else None
+
+    # Get demo timestamps from events if available
+    clap_demo_t_sec: Optional[float] = None
+    arms_demo_t_sec: Optional[float] = None
+
+    if imit_events_df is not None and len(imit_events_df) > 0:
+        # Filter to parent events
+        parent_events = imit_events_df[
+            (imit_events_df["subject"].isin(["parent", "adult"]))
+        ]
+
+        # Find first CLAP demo
+        clap_demos = parent_events[
+            (parent_events["action_type"].str.upper() == "CLAP")
+            & (parent_events["event_type"].str.upper().str.contains("START|DEMO"))
+        ]
+        if len(clap_demos) > 0:
+            clap_demo_t_sec = float(clap_demos.iloc[0]["t_sec"])
+
+        # Find first ARMS_UP demo
+        arms_demos = parent_events[
+            (parent_events["action_type"].str.upper() == "ARMS_UP")
+            & (parent_events["event_type"].str.upper().str.contains("START|DEMO"))
+        ]
+        if len(arms_demos) > 0:
+            arms_demo_t_sec = float(arms_demos.iloc[0]["t_sec"])
+
+    # Create outcome for CLAP if demo was present
+    if clap_demo_present:
+        latency_ms = clap_latency_sec * 1000 if clap_latency_sec is not None else None
+
+        if clap_response_present:
+            if latency_ms is not None and latency_ms > DELAYED_THRESHOLD_MS:
+                status = "delayed"
+            else:
+                status = "observed"
+        else:
+            status = "not_observed"
+
+        outcomes.append({
+            "task_type": "imitation",
+            "action_type": "CLAP",
+            "event_type": "PARENT_CLAP",
+            "t_sec": clap_demo_t_sec or 0.0,
+            "responded": clap_response_present,
+            "latency_ms": latency_ms,
+            "status": status,
+        })
+
+    # Create outcome for ARMS_UP if demo was present
+    if arms_demo_present:
+        latency_ms = arms_latency_sec * 1000 if arms_latency_sec is not None else None
+
+        if arms_response_present:
+            if latency_ms is not None and latency_ms > DELAYED_THRESHOLD_MS:
+                status = "delayed"
+            else:
+                status = "observed"
+        else:
+            status = "not_observed"
+
+        outcomes.append({
+            "task_type": "imitation",
+            "action_type": "ARMS_UP",
+            "event_type": "PARENT_ARMS_UP",
+            "t_sec": arms_demo_t_sec or 0.0,
+            "responded": arms_response_present,
+            "latency_ms": latency_ms,
+            "status": status,
+        })
+
+    return outcomes

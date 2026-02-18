@@ -11,3 +11,9 @@ class VideoOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class VideoWithVisitOut(VideoOut):
+    """VideoOut with visit details for navigation"""
+    child_id: int
+    visit_number: int

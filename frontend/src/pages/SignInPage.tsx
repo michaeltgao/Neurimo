@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import logo from "../assets/logo.png";
 
 export default function SignInPage() {
   const [email, setEmail] = useState("");
@@ -43,9 +44,7 @@ export default function SignInPage() {
     >
       <div style={{ width: "100%", maxWidth: 320, padding: 24 }}>
         <div style={{ marginBottom: 40, textAlign: "center" }}>
-          <h1 style={{ marginBottom: 4, fontSize: "1.75rem", fontWeight: 600, letterSpacing: "-0.02em" }}>
-            Neurimo
-          </h1>
+          <img src={logo} alt="Neurimo" style={{ height: 64, marginBottom: 4, marginLeft: 30 }} />
           <p style={{ margin: 0, color: "var(--color-text-secondary)", fontSize: "0.8125rem", fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.05em" }}>
             Clinician Web Portal
           </p>

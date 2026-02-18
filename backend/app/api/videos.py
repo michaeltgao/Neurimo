@@ -5,11 +5,12 @@ from app.core.database import get_db
 from app.models.visit import Visit
 from app.models.video import Video
 from app.schemas import video
-from app.schemas.video import VideoOut
+from app.schemas.video import VideoOut, VideoWithVisitOut
 from app.services.file_storage import save_visit_video, ALLOWED_TASKS
 from app.services.file_storage import save_json, annotations_filename
 from app.services.annotations import make_placeholder_annotations
 from app.services.file_storage import load_json
+from app.services.guided_review import build_guided_review_data, get_overlay_data
 
 router = APIRouter(tags=["videos"])
 
@@ -129,9 +130,130 @@ def get_video_annotations(video_id: int, db: Session = Depends(get_db)):
             detail="Annotations file missing on disk",
         )
     
-@router.get("/videos/{video_id}", response_model=VideoOut)
+@router.get("/videos/{video_id}", response_model=VideoWithVisitOut)
 def get_video(video_id: int, db: Session = Depends(get_db)):
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-    return video
+
+    visit = db.query(Visit).filter(Visit.id == video.visit_id).first()
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found")
+
+    return VideoWithVisitOut(
+        id=video.id,
+        visit_id=video.visit_id,
+        task_type=video.task_type,
+        storage_path=video.storage_path,
+        status=video.status,
+        created_at=video.created_at,
+        child_id=visit.child_id,
+        visit_number=visit.visit_number,
+    )
+
+
+@router.get("/videos/{video_id}/guided-review")
+def get_guided_review_data(
+    video_id: int,
+    duration_ms: float = Query(10000, description="Video duration in milliseconds"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get guided review data for a video.
+
+    Transforms ML pipeline outputs (audio events, pose tracks, behavioral events)
+    into the GuidedReviewData format expected by the frontend.
+
+    Query params:
+        duration_ms: Video duration in milliseconds (frontend probes this)
+    """
+    # Get video and its visit
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    visit = db.query(Visit).filter(Visit.id == video.visit_id).first()
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found")
+
+    # Compute age bucket from visit age_months
+    age_months = visit.age_months or 18
+    if age_months < 12:
+        age_bucket = "0-12 months"
+    elif age_months < 24:
+        age_bucket = "12-24 months"
+    elif age_months < 36:
+        age_bucket = "24-36 months"
+    else:
+        age_bucket = "36+ months"
+
+    # Build video URL
+    import os
+    base_url = os.getenv("VITE_API_BASE_URL", "http://localhost:8000")
+    storage_path = video.storage_path
+
+    # Handle different path formats
+    if storage_path.startswith("/static/"):
+        video_url = f"{base_url}{storage_path}"
+    elif "data/" in storage_path:
+        idx = storage_path.find("data/")
+        rel = storage_path[idx + len("data/"):]
+        video_url = f"{base_url}/static/{rel}"
+    else:
+        video_url = f"{base_url}/static/{storage_path}"
+
+    # Build guided review data from ML pipeline
+    try:
+        data = build_guided_review_data(
+            video_id=video_id,
+            visit_id=visit.id,
+            task_type=video.task_type,
+            video_url=video_url,
+            duration_ms=duration_ms,
+            age_bucket=age_bucket,
+        )
+        return data
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to build guided review data: {str(e)}"
+        )
+
+
+@router.get("/videos/{video_id}/overlay-data")
+def get_video_overlay_data(
+    video_id: int,
+    duration_ms: float = Query(10000, description="Video duration in milliseconds"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get frame-level overlay data for video annotation visualization.
+
+    Returns pose landmarks, bounding boxes, head orientation, and event data
+    for rendering real-time overlays on the video player.
+
+    Query params:
+        duration_ms: Video duration in milliseconds
+    """
+    # Get video and its visit
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    visit = db.query(Visit).filter(Visit.id == video.visit_id).first()
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found")
+
+    try:
+        data = get_overlay_data(
+            video_id=video_id,
+            visit_id=visit.id,
+            task_type=video.task_type,
+            duration_ms=duration_ms,
+        )
+        return data
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get overlay data: {str(e)}"
+        )

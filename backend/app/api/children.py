@@ -3,7 +3,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.child import Child
-from app.schemas.child import ChildCreate, ChildOut
+from app.schemas.child import ChildCreate, ChildUpdate, ChildOut
 
 router = APIRouter(prefix="/children", tags=["children"])
 
@@ -24,6 +24,20 @@ def get_child(child_id: int, db: Session = Depends(get_db)):
     child = db.query(Child).filter(Child.id == child_id).first()
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
+    return child
+
+@router.patch("/{child_id}", response_model=ChildOut)
+def update_child(child_id: int, payload: ChildUpdate, db: Session = Depends(get_db)):
+    child = db.query(Child).filter(Child.id == child_id).first()
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    update_data = payload.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(child, field, value)
+
+    db.commit()
+    db.refresh(child)
     return child
 
 @router.delete("/{child_id}")

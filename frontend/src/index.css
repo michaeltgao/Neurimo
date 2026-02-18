@@ -146,3 +146,23 @@ input[type="checkbox"] {
   margin-right: 8px;
   accent-color: var(--color-text);
 }
+
+/* Loading skeleton animation */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Spinner animation */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}

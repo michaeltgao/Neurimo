@@ -5,6 +5,10 @@ class VisitCreate(BaseModel):
     visit_date: date
     age_months: int
 
+class VisitUpdate(BaseModel):
+    visit_date: date | None = None
+    age_months: int | None = None
+
 class VisitOut(BaseModel):
     id: int
     child_id: int
