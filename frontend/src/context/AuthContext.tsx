@@ -18,7 +18,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [isAuthenticated]);
 
   function login(_password: string): boolean {
-    // For now, accept any password
     setIsAuthenticated(true);
     return true;
   }

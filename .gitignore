@@ -1,11 +1,8 @@
-# Data files - uploaded videos and annotations stored on disk
+# Data files
 data/uploads/
 data/annotations/
 data/derived/
 data/logs/
-
-# Keep training data tracked (optional - remove if you want to exclude)
-# data/videos/
 
 # Environment
 .env
@@ -20,24 +17,25 @@ __pycache__/
 venv/
 *.egg-info/
 .mypy_cache/
+.pytest_cache/
+
+# Node
+node_modules/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# OS
 .DS_Store
+Thumbs.db
 
 # Docker
 *.log
-# videos
-*.mp4
-*.mov
-*.m4v
-*.avi
-*.mkv
-*.webm
-# videos
+
+# Videos
 *.mp4
 *.mov
 *.m4v

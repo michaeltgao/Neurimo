@@ -650,7 +650,7 @@ def main():
             oof_preds, summary, fold_thresholds = run_cv_with_config(
                 Z, y, fold_indices, C, cw_parsed, args.seed, sample_weight,
                 scale_features=args.scale_meta_features,
-                verbose=False,  # Set True for debugging
+                verbose=False,
             )
 
             score = summary[args.select_metric][0]  # mean
